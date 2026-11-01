@@ -32,6 +32,9 @@ pub struct Node {
     pub mtime: i64,
     /// The directory could not be read (usually missing permissions).
     pub unreadable: bool,
+    /// Cloud placeholder (e.g. Google Drive streaming): listed, but its
+    /// contents aren't stored on this Mac. Folders like this aren't opened.
+    pub online_only: bool,
     /// Deleted after the scan; no longer reachable from the root.
     pub removed: bool,
 }
@@ -141,6 +144,7 @@ pub struct Scan {
 
 pub fn scan(root: &Path, one_volume: bool, progress: &Progress) -> Result<Scan, String> {
     let started = Instant::now();
+    never_materialize_dataless_files();
     let meta = fs::metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a folder", root.display()));
@@ -202,6 +206,7 @@ struct Raw {
     files: u64,
     mtime: i64,
     unreadable: bool,
+    online_only: bool,
     children: Vec<Raw>,
 }
 
@@ -227,9 +232,11 @@ impl Walker<'_> {
             files: 0,
             mtime: meta.mtime(),
             unreadable: false,
+            online_only: is_dataless(meta),
             children: Vec::new(),
         };
-        if self.progress.cancel.load(Ordering::Relaxed) {
+        // Listing an online-only folder would make the cloud provider fetch it.
+        if raw.online_only || self.progress.cancel.load(Ordering::Relaxed) {
             return raw;
         }
         let entries: Vec<fs::DirEntry> = match fs::read_dir(path) {
@@ -283,12 +290,38 @@ impl Walker<'_> {
             files: 1,
             mtime: meta.mtime(),
             unreadable: false,
+            online_only: is_dataless(&meta),
             children: Vec::new(),
         })
     }
 }
 
 const DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// The file or folder is a cloud placeholder whose data isn't on this Mac.
+fn is_dataless(meta: &fs::Metadata) -> bool {
+    const SF_DATALESS: u32 = 0x4000_0000;
+    std::os::macos::fs::MetadataExt::st_flags(meta) & SF_DATALESS != 0
+}
+
+/// Ask macOS never to download cloud placeholders on this process's behalf,
+/// so a scan can't trigger Google Drive / iCloud / Dropbox fetches.
+fn never_materialize_dataless_files() {
+    const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: i32 = 3;
+    const IOPOL_SCOPE_PROCESS: i32 = 0;
+    const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: i32 = 1;
+    unsafe extern "C" {
+        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    }
+    // SAFETY: plain libc call with constant arguments; only affects this process.
+    unsafe {
+        setiopolicy_np(
+            IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+            IOPOL_SCOPE_PROCESS,
+            IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+        );
+    }
+}
 
 /// Attach `child` at `path` below `raw`, adding its totals to every folder on the way.
 fn graft(raw: &mut Raw, path: &[&str], child: Raw) {
@@ -317,6 +350,7 @@ fn flatten(raw: Raw, parent: Option<NodeId>, nodes: &mut Vec<Node>) -> NodeId {
         files: raw.files,
         mtime: raw.mtime,
         unreadable: raw.unreadable,
+        online_only: raw.online_only,
         removed: false,
     });
     let mut kids = raw.children;
@@ -424,7 +458,7 @@ mod tests {
 
     fn raw(name: &str, alloc: u64, children: Vec<Raw>) -> Raw {
         let alloc = alloc + children.iter().map(|c| c.alloc).sum::<u64>();
-        Raw { name: name.into(), is_dir: true, alloc, apparent: alloc, files: 0, mtime: 0, unreadable: false, children }
+        Raw { name: name.into(), is_dir: true, alloc, apparent: alloc, files: 0, mtime: 0, unreadable: false, online_only: false, children }
     }
 
     #[test]

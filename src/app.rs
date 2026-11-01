@@ -481,6 +481,8 @@ impl App {
         x += name_w + 8.0;
         let tag = if node.unreadable {
             Some(("no access", vis.warn_fg_color))
+        } else if node.online_only {
+            Some(("online only", Color32::from_rgb(90, 140, 210)))
         } else if !node.is_dir && node.is_sparse() {
             Some(("sparse", Color32::from_rgb(90, 170, 120)))
         } else {
@@ -986,7 +988,14 @@ fn node_tooltip(ui: &mut egui::Ui, tree: &Tree, id: NodeId) {
         ui.label(fmt_age(scan::now_secs() - n.mtime));
         ui.end_row();
     });
-    if n.is_sparse() {
+    if n.online_only {
+        ui.add_space(4.0);
+        let what = if n.is_dir { "folder" } else { "file" };
+        ui.label(
+            RichText::new(format!("Online only: this {what} is in the cloud, not stored on this Mac"))
+                .color(Color32::from_rgb(90, 140, 210)),
+        );
+    } else if n.is_sparse() {
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!("Sparse: {} of its logical size isn't stored", fmt_size(n.apparent - n.alloc)))
