@@ -1,0 +1,14 @@
+[package]
+name = "duw"
+version = "0.1.0"
+edition = "2024"
+description = "Disk usage viewer that reports actual on-disk (allocated) sizes"
+
+[dependencies]
+eframe = { version = "0.29", features = ["persistence"] }
+rfd = "0.15"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
