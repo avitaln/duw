@@ -15,6 +15,8 @@ const ROW_H: f32 = 28.0;
 const TEXT: f32 = 14.5;
 /// Secondary text (apparent size, percentages, details).
 const SMALL: f32 = 12.5;
+const FULL_DISK_ACCESS_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 /// How long a confirmation stays in the status bar.
 const NOTICE_FOR: Duration = Duration::from_secs(8);
 
@@ -369,8 +371,14 @@ impl App {
                     ui.label(
                         RichText::new(format!("· ⚠ {} folders unreadable", fmt_count(scan.unreadable as u64)))
                             .color(ui.visuals().warn_fg_color),
-                    )
-                    .on_hover_text("Grant the app Full Disk Access to see everything");
+                    );
+                    if ui
+                        .small_button("Grant Full Disk Access…")
+                        .on_hover_text("macOS never asks for this: add duw in the list that opens, then rescan")
+                        .clicked()
+                    {
+                        let _ = Command::new("open").arg(FULL_DISK_ACCESS_SETTINGS).spawn();
+                    }
                 }
             } else {
                 ui.label("Choose a folder, or drop one onto the window.");

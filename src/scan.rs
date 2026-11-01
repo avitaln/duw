@@ -145,18 +145,35 @@ pub fn scan(root: &Path, one_volume: bool, progress: &Progress) -> Result<Scan, 
     if !meta.is_dir() {
         return Err(format!("{} is not a folder", root.display()));
     }
+    // On macOS, /Users, /Applications, /Library, … are firmlinks into the Data
+    // volume, so from "/" the same folders are also reachable under
+    // /System/Volumes/Data. Walk the familiar paths first and the Data volume
+    // last; the visited-folder set then leaves only what isn't firmlinked.
+    let data_volume = Path::new(DATA_VOLUME);
+    let deferred = (root == Path::new("/"))
+        .then(|| fs::metadata(data_volume).ok())
+        .flatten()
+        .filter(|m| m.is_dir());
     let walker = Walker {
         progress,
         root_dev: meta.dev(),
         one_volume,
         hardlinks: Mutex::new(HashSet::new()),
+        dirs: Mutex::new(HashSet::from([(meta.dev(), meta.ino())])),
+        skip: deferred.is_some().then(|| data_volume.to_path_buf()),
     };
     // Deep trees recurse through nested rayon jobs; give workers room.
     let pool = rayon::ThreadPoolBuilder::new()
         .stack_size(16 << 20)
         .build()
         .map_err(|e| e.to_string())?;
-    let raw = pool.install(|| walker.dir(root, root.display().to_string(), &meta));
+    let mut raw = pool.install(|| walker.dir(root, root.display().to_string(), &meta));
+    if let Some(data_meta) = deferred {
+        if walker.dirs.lock().unwrap().insert((data_meta.dev(), data_meta.ino())) {
+            let data = pool.install(|| walker.dir(data_volume, "Data".into(), &data_meta));
+            graft(&mut raw, &["System", "Volumes"], data);
+        }
+    }
     if progress.cancel.load(Ordering::Relaxed) {
         return Err("Scan cancelled".into());
     }
@@ -193,6 +210,11 @@ struct Walker<'a> {
     root_dev: u64,
     one_volume: bool,
     hardlinks: Mutex<HashSet<(u64, u64)>>,
+    /// Folders already walked, by (device, inode). A folder reachable by two
+    /// paths (macOS firmlinks) is counted once, and loops are impossible.
+    dirs: Mutex<HashSet<(u64, u64)>>,
+    /// Folder left out of the main walk, to be walked afterwards.
+    skip: Option<PathBuf>,
 }
 
 impl Walker<'_> {
@@ -235,7 +257,14 @@ impl Walker<'_> {
             if self.one_volume && meta.dev() != self.root_dev {
                 return None;
             }
-            return Some(self.dir(&e.path(), name, &meta));
+            let path = e.path();
+            if self.skip.as_ref() == Some(&path) {
+                return None;
+            }
+            if !self.dirs.lock().unwrap().insert((meta.dev(), meta.ino())) {
+                return None;
+            }
+            return Some(self.dir(&path, name, &meta));
         }
         let mut alloc = meta.blocks() * 512;
         let mut apparent = meta.len();
@@ -256,6 +285,23 @@ impl Walker<'_> {
             unreadable: false,
             children: Vec::new(),
         })
+    }
+}
+
+const DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// Attach `child` at `path` below `raw`, adding its totals to every folder on the way.
+fn graft(raw: &mut Raw, path: &[&str], child: Raw) {
+    raw.alloc += child.alloc;
+    raw.apparent += child.apparent;
+    raw.files += child.files;
+    raw.mtime = raw.mtime.max(child.mtime);
+    let next = path
+        .first()
+        .and_then(|name| raw.children.iter_mut().find(|c| c.is_dir && c.name == *name));
+    match next {
+        Some(dir) => graft(dir, &path[1..], child),
+        None => raw.children.push(child),
     }
 }
 
@@ -374,6 +420,22 @@ mod tests {
         // The 1 MB file is counted once even though it has two names.
         assert!(root.alloc >= 1 << 20 && root.alloc < 3 << 20, "root alloc = {}", root.alloc);
         assert_eq!(scan.largest[0], tree.nodes.iter().position(|n| n.alloc >= 1 << 20 && !n.is_dir).unwrap());
+    }
+
+    fn raw(name: &str, alloc: u64, children: Vec<Raw>) -> Raw {
+        let alloc = alloc + children.iter().map(|c| c.alloc).sum::<u64>();
+        Raw { name: name.into(), is_dir: true, alloc, apparent: alloc, files: 0, mtime: 0, unreadable: false, children }
+    }
+
+    #[test]
+    fn graft_adds_child_and_totals_along_the_path() {
+        let mut root = raw("/", 1, vec![raw("System", 1, vec![raw("Volumes", 1, vec![])]), raw("Users", 50, vec![])]);
+        graft(&mut root, &["System", "Volumes"], raw("Data", 7, vec![]));
+        assert_eq!(root.alloc, 60);
+        let system = &root.children[0];
+        assert_eq!(system.alloc, 9);
+        assert_eq!(system.children[0].alloc, 8);
+        assert_eq!(system.children[0].children[0].name, "Data");
     }
 
     #[test]
