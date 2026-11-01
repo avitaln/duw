@@ -32,6 +32,8 @@ pub struct Node {
     pub mtime: i64,
     /// The directory could not be read (usually missing permissions).
     pub unreadable: bool,
+    /// Deleted after the scan; no longer reachable from the root.
+    pub removed: bool,
 }
 
 impl Node {
@@ -67,6 +69,43 @@ impl Tree {
         }
         chain.reverse();
         chain
+    }
+
+    /// Forget `id` and everything under it, shrinking its ancestors to match.
+    fn remove(&mut self, id: NodeId) {
+        let Some(parent) = self.nodes[id].parent else { return };
+        let (alloc, apparent, files) = {
+            let n = &self.nodes[id];
+            (n.alloc, n.apparent, n.files)
+        };
+        let mut stack = vec![id];
+        while let Some(n) = stack.pop() {
+            self.nodes[n].removed = true;
+            stack.extend_from_slice(&self.nodes[n].children);
+        }
+        self.nodes[parent].children.retain(|&c| c != id);
+
+        let ancestors = self.ancestors(parent);
+        for &a in &ancestors {
+            let n = &mut self.nodes[a];
+            n.alloc = n.alloc.saturating_sub(alloc);
+            n.apparent = n.apparent.saturating_sub(apparent);
+            n.files = n.files.saturating_sub(files);
+        }
+        // The shrunken ancestors may now sort lower among their siblings.
+        for &a in &ancestors {
+            let mut kids = std::mem::take(&mut self.nodes[a].children);
+            kids.sort_by(|&x, &y| self.nodes[y].alloc.cmp(&self.nodes[x].alloc));
+            self.nodes[a].children = kids;
+        }
+    }
+}
+
+impl Scan {
+    /// Forget a file or folder that was deleted after the scan.
+    pub fn remove(&mut self, id: NodeId) {
+        self.tree.remove(id);
+        collect_stats(self);
     }
 }
 
@@ -232,6 +271,7 @@ fn flatten(raw: Raw, parent: Option<NodeId>, nodes: &mut Vec<Node>) -> NodeId {
         files: raw.files,
         mtime: raw.mtime,
         unreadable: raw.unreadable,
+        removed: false,
     });
     let mut kids = raw.children;
     kids.sort_unstable_by(|a, b| b.alloc.cmp(&a.alloc));
@@ -261,8 +301,12 @@ fn collect_stats(scan: &mut Scan) {
     let now = now_secs();
     let mut types: HashMap<String, (u64, u64)> = HashMap::new();
     let mut files = Vec::new();
+    scan.unreadable = 0;
 
     for (id, n) in scan.tree.nodes.iter().enumerate() {
+        if n.removed {
+            continue;
+        }
         if n.is_dir {
             scan.unreadable += n.unreadable as usize;
             continue;
@@ -330,5 +374,38 @@ mod tests {
         // The 1 MB file is counted once even though it has two names.
         assert!(root.alloc >= 1 << 20 && root.alloc < 3 << 20, "root alloc = {}", root.alloc);
         assert_eq!(scan.largest[0], tree.nodes.iter().position(|n| n.alloc >= 1 << 20 && !n.is_dir).unwrap());
+    }
+
+    #[test]
+    fn removing_a_subtree_shrinks_ancestors_and_stats() {
+        let dir = std::env::temp_dir().join(format!("duw-remove-{}", std::process::id()));
+        fs::create_dir_all(dir.join("big/inner")).unwrap();
+        fs::create_dir_all(dir.join("small")).unwrap();
+        fs::write(dir.join("big/inner/a.bin"), vec![1u8; 3 << 20]).unwrap();
+        fs::write(dir.join("big/b.bin"), vec![1u8; 1 << 20]).unwrap();
+        fs::write(dir.join("small/c.txt"), vec![1u8; 2 << 20]).unwrap();
+
+        let mut scan = scan(&dir, true, &Progress::default()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        let id = |scan: &Scan, name: &str| scan.tree.nodes.iter().position(|n| n.name == name).unwrap();
+        let (big, small, inner) = (id(&scan, "big"), id(&scan, "small"), id(&scan, "inner"));
+        let root_before = scan.tree.nodes[Tree::ROOT].alloc;
+        let inner_alloc = scan.tree.nodes[inner].alloc;
+        assert_eq!(scan.tree.nodes[Tree::ROOT].children, vec![big, small]);
+
+        scan.remove(inner);
+
+        let nodes = &scan.tree.nodes;
+        assert!(nodes[inner].removed);
+        assert!(nodes[id(&scan, "a.bin")].removed);
+        assert_eq!(nodes[Tree::ROOT].alloc, root_before - inner_alloc);
+        assert_eq!(nodes[Tree::ROOT].files, 2);
+        assert!(!nodes[big].children.contains(&inner));
+        // "big" is now smaller than "small", so the root's children reorder.
+        assert_eq!(nodes[Tree::ROOT].children, vec![small, big]);
+        assert_eq!(scan.largest.len(), 2);
+        assert!(!scan.largest.contains(&id(&scan, "a.bin")));
+        assert_eq!(scan.types.iter().find(|t| t.ext == ".bin").unwrap().count, 1);
     }
 }

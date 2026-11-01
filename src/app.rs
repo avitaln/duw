@@ -15,6 +15,8 @@ const ROW_H: f32 = 28.0;
 const TEXT: f32 = 14.5;
 /// Secondary text (apparent size, percentages, details).
 const SMALL: f32 = 12.5;
+/// How long a confirmation stays in the status bar.
+const NOTICE_FOR: Duration = Duration::from_secs(8);
 
 /// Use the macOS system fonts (as in System Settings and Finder). egui's own
 /// fonts stay at the end of each list, so the app still works without them.
@@ -55,6 +57,7 @@ enum Action {
     Reveal(NodeId),
     Open(NodeId),
     CopyPath(NodeId),
+    Trash(NodeId),
 }
 
 struct Running {
@@ -76,6 +79,10 @@ pub struct App {
     focus: NodeId,
     tab: Tab,
     scroll_to_selected: bool,
+    /// Short-lived confirmation shown in the status bar.
+    notice: Option<(String, Instant)>,
+    /// The path field has keyboard focus, so ⌘⌫ belongs to it.
+    editing_path: bool,
     /// `DUW_SCREENSHOT=out.ppm`: save the window once the scan is shown, then quit.
     screenshot: Option<(PathBuf, u32)>,
 }
@@ -115,6 +122,8 @@ impl App {
             focus: Tree::ROOT,
             tab: Tab::Chart,
             scroll_to_selected: false,
+            notice: None,
+            editing_path: false,
             screenshot: std::env::var_os("DUW_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
         };
         if initial.is_some() {
@@ -166,9 +175,13 @@ impl App {
         }
     }
 
-    fn apply(&mut self, ctx: &egui::Context, scan: &Scan, actions: Vec<Action>) {
-        let tree = &scan.tree;
+    fn apply(&mut self, ctx: &egui::Context, scan: &mut Scan, actions: Vec<Action>) {
         for action in actions {
+            if let Action::Trash(id) = action {
+                self.trash(ctx, scan, id);
+                continue;
+            }
+            let tree = &scan.tree;
             match action {
                 Action::Select(id) => {
                     self.selected = Some(id);
@@ -196,8 +209,48 @@ impl App {
                     let _ = Command::new("open").arg(tree.path(id)).spawn();
                 }
                 Action::CopyPath(id) => ctx.copy_text(tree.path(id).display().to_string()),
+                Action::Trash(_) => unreachable!(),
             }
         }
+    }
+
+    /// Move a file or folder (with everything inside) to the Trash, like Finder.
+    fn trash(&mut self, ctx: &egui::Context, scan: &mut Scan, id: NodeId) {
+        let node = &scan.tree.nodes[id];
+        let Some(parent) = node.parent else { return }; // never the scanned folder itself
+        if node.removed {
+            return;
+        }
+        let (name, alloc) = (node.name.clone(), node.alloc);
+        let path = scan.tree.path(id);
+        let out = match Command::new("/usr/bin/trash").arg(&path).output() {
+            Ok(out) => out,
+            Err(e) => {
+                self.error = Some(format!("Couldn't run /usr/bin/trash: {e}"));
+                return;
+            }
+        };
+        if !out.status.success() {
+            // stderr is an NSLog line; the readable reason is the first quoted part.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let reason = stderr.split('"').nth(1).unwrap_or(stderr.trim());
+            self.error = Some(format!("Couldn't move “{name}” to the Trash: {reason}"));
+            return;
+        }
+
+        scan.remove(id);
+        if self.selected.is_some_and(|s| scan.tree.nodes[s].removed) {
+            self.selected = Some(parent);
+        }
+        if scan.tree.nodes[self.focus].removed {
+            self.focus = parent;
+        }
+        self.error = None;
+        self.notice = Some((
+            format!("Moved “{name}” to the Trash ({}). Empty the Trash to free the space.", fmt_size(alloc)),
+            Instant::now(),
+        ));
+        ctx.request_repaint_after(NOTICE_FOR);
     }
 
     fn debug_screenshot(&mut self, ctx: &egui::Context) {
@@ -284,6 +337,7 @@ impl App {
                         .desired_width(ui.available_width())
                         .hint_text("Folder to scan"),
                 );
+                self.editing_path = edit.has_focus();
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     start = true;
                 }
@@ -303,6 +357,8 @@ impl App {
                 ));
             } else if let Some(e) = &self.error {
                 ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {e}"));
+            } else if let Some((notice, _)) = self.notice.as_ref().filter(|(_, at)| at.elapsed() < NOTICE_FOR) {
+                ui.colored_label(Color32::from_rgb(70, 160, 100), format!("✔ {notice}"));
             } else if let Some(scan) = &self.scan {
                 let root = &scan.tree.nodes[Tree::ROOT];
                 ui.label(RichText::new(format!("{} on disk", fmt_size(root.alloc))).strong());
@@ -739,8 +795,15 @@ impl eframe::App for App {
                 Tab::Ages => self.ages_view(ui, &scan),
             }
         });
+        // ⌘⌫ trashes the selection, as in Finder (but not while typing a path).
+        if let Some(sel) = self.selected.filter(|_| !self.editing_path) {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Backspace)) {
+                actions.push(Action::Trash(sel));
+            }
+        }
         self.scroll_to_selected = false;
-        self.apply(ctx, &scan, actions);
+        let mut scan = scan;
+        self.apply(ctx, &mut scan, actions);
         self.scan = Some(scan);
     }
 }
@@ -941,6 +1004,13 @@ fn node_menu(ui: &mut egui::Ui, tree: &Tree, id: NodeId, actions: &mut Vec<Actio
     item(ui, if n.is_dir { "Open in Finder" } else { "Open" }, Action::Open(id));
     item(ui, "Show in tree and chart", Action::Locate(id));
     item(ui, "Copy path", Action::CopyPath(id));
+    if n.parent.is_some() {
+        ui.separator();
+        if ui.add(egui::Button::new("Move to Trash").shortcut_text("⌘⌫")).clicked() {
+            actions.push(Action::Trash(id));
+            ui.close_menu();
+        }
+    }
 }
 
 fn chart_focus_for(tree: &Tree, id: NodeId) -> NodeId {
